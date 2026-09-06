@@ -1,0 +1,124 @@
+# ==============================================================================
+# .gitignore - payment-ms
+# Regras de exclusão para Git: Node.js, TypeScript, Docker, Testes e IDEs
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Dependências
+# ------------------------------------------------------------------------------
+node_modules/
+jspm_packages/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+
+# ------------------------------------------------------------------------------
+# 2. Compilação e Artefatos de Build
+# ------------------------------------------------------------------------------
+dist/
+build/
+out/
+bin/
+*.tsbuildinfo
+.turbo/
+.cache/
+
+# ------------------------------------------------------------------------------
+# 3. Logs e Saídas de Processos
+# ------------------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ------------------------------------------------------------------------------
+# 4. Ambientes, Chaves e Segredos
+# ------------------------------------------------------------------------------
+# Ignora todos os arquivos .env reais e locais
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Garante o versionamento exclusivo do template documentado
+!.env.example
+
+# Chaves criptográficas e certificados
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+
+# ------------------------------------------------------------------------------
+# 5. Cobertura de Testes e Relatórios
+# ------------------------------------------------------------------------------
+coverage/
+.nyc_output/
+reports/
+test-results/
+
+# ------------------------------------------------------------------------------
+# 6. Dados de Execução do CDC e Docker Local
+# ------------------------------------------------------------------------------
+debezium/data/
+*.dat
+*.db
+*.sqlite
+*.sqlite3
+
+# ------------------------------------------------------------------------------
+# 7. Arquivos Temporários do Sistema Operacional
+# ------------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+
+# ------------------------------------------------------------------------------
+# 8. Configurações de IDEs e Editores
+# ------------------------------------------------------------------------------
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
+*.bak
+
+# VSCode (ignora arquivos locais de estado, mantendo recomendações caso existam)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/

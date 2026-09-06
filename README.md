@@ -1,0 +1,416 @@
+# 💳 Microsserviço de Pagamentos (`payment-ms`)
+
+> **Laboratório de Engenharia de Software:** Microsserviço assíncrono e orientando a eventos para processamento financeiro, construído com **Clean Architecture**, **Domain-Driven Design (DDD)**, **Transactional Outbox com Change Data Capture (CDC)**, **RabbitMQ**, **PostgreSQL** e **Docker**.
+
+---
+
+![Node.js](https://img.shields.io/badge/Node.js-22_LTS-339933?style=for-the-badge&logo=node.js&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
+![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=for-the-badge&logo=fastify&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)
+![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.x-FF6600?style=for-the-badge&logo=rabbitmq&logoColor=white)
+![Debezium](https://img.shields.io/badge/Debezium-CDC_Outbox-red?style=for-the-badge&logo=apache-kafka&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Multi--stage-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![Jest](https://img.shields.io/badge/Coverage-99%25-C21325?style=for-the-badge&logo=jest&logoColor=white)
+
+---
+
+## 1. Visão Geral e Objetivo do Laboratório
+
+O **`payment-ms`** é um microsserviço de processamento de pagamentos integrante de um ecossistema distribuído de e-commerce. Ele atua como um **consumidor assíncrono** orientado a eventos, orquestrando a cobrança financeira gerada no momento em que um pedido é criado no `order-ms`.
+
+### Principais Responsabilidades:
+1. **Consumo Confiável:** Consumir eventos `order.created` emitidos pelo ecossistema na exchange `order.events`.
+2. **Garantia de Idempotência:** Prevenir cobranças duplicadas para o mesmo `orderId`, garantindo processamento atômico e seguro.
+3. **Isolamento de Negócio (DDD):** Modelar o ciclo de vida do pagamento (`Payment` Aggregate Root) com regras invariantes estritas e transições de estado ricas (`PENDING` $\rightarrow$ `SUCCEEDED` ou `FAILED`).
+4. **Resiliência Transacional (Transactional Outbox Pattern):** Persistir o estado do pagamento e os eventos de saída de forma atômica no PostgreSQL (`BEGIN ... COMMIT`), delegando o despacho ao RabbitMQ para o **Debezium Server (CDC)** via WAL (`pgoutput`).
+5. **Notificação do Ecossistema:** Publicar os eventos de resultado `payment.succeeded` ou `payment.failed` na exchange dedicada `payment.events`.
+
+---
+
+## 2. Arquitetura e Princípios de Design
+
+A aplicação segue rigorosamente os preceitos da **Clean Architecture** (Robert C. Martin) e do **Hexagonal Architecture (Ports & Adapters)**, com regra de dependência unidirecional voltada para o centro:
+
+```
+                      +-------------------------------------------------+
+                      |              Adapters (Driving)                 |
+                      |   RabbitMQ Consumer | Fastify HTTP Controllers  |
+                      |                       |                         |
+                      |                       v                         |
+                      |  +-------------------------------------------+  |
+                      |  |               Application                 |  |
+                      |  |   Use Cases | Pure DTOs | Ports (Outbound)|  |
+                      |  |                    |                      |  |
+                      |  |                    v                      |  |
+                      |  |  +-------------------------------------+  |  |
+                      |  |  |               Domain                |  |  |
+                      |  |  | Aggregates | Value Objects | Events |  |  |
+                      |  |  |        [100% Puro TypeScript]       |  |  |
+                      |  |  +-------------------------------------+  |  |
+                      |  +-------------------------------------------+  |
+                      |                       ^                         |
+                      |                       |                         |
+                      |            Infrastructure (Driven)              |
+                      |   PostgreSQL Pool | Gateways | Debezium CDC     |
+                      +-------------------------------------------------+
+```
+
+### 2.1. Segregação de Camadas
+
+* **`Domain` (`src/domain/`):**
+  * Núcleo agnóstico sem qualquer dependência externa (zero frameworks ou bibliotecas de runtime).
+  * **Aggregate Root (`Payment`):** Controla o acesso às mutações de estado, invariantes (`amount > 0`, `installments >= 1`) e emite eventos de domínio em memória (`PaymentSucceededEvent`, `PaymentFailedEvent`).
+  * **Value Object (`Amount`):** Encapsula validação monetária e imutabilidade via `Object.freeze`.
+  * **Domain Errors:** Hierarquia de exceções de negócio tipadas (`DomainValidationError`, `PaymentAlreadyFinalizedError`).
+
+* **`Application` (`src/application/`):**
+  * Orquestra as operações de negócio sem conhecer detalhes de banco de dados ou mensageria.
+  * **Casos de Uso:** `ProcessPaymentUseCase`, `GetPaymentByIdUseCase`, `GetPaymentByOrderIdUseCase`.
+  * **Portas de Saída (Ports):** Interfaces abstratas `PaymentRepository`, `PaymentGateway`, `CardTokenVaultGateway`.
+  * **Princípio da Inversão de Dependência (DIP):** O caso de uso depende apenas das portas, não de classes concretas.
+
+* **`Adapters` (`src/adapters/`):**
+  * Adaptadores primários (driving):
+    * **RabbitMQ Consumer (`order-created.consumer.ts`):** Escuta a fila `payment-service.order-created`, desempacota envelopes CDC e encaminha ao caso de uso.
+    * **Controladores HTTP (`payment.controller.ts`, `health.controller.ts`):** Exposição REST e healthcheck liveness/readiness.
+
+* **`Infrastructure` (`src/infra/`):**
+  * Adaptadores secundários (driven):
+    * **`PostgresPaymentRepository`:** Persistência relacional atômica da entidade e escrita dos eventos na tabela `outbox`.
+    * **`MockPaymentGateway`:** Simulação financeira com latência realista (300ms a 1800ms) e regra de falha determinística para testes (`customerId === "teste-123"`).
+    * **`MockCardTokenVaultGateway`:** Simulação de cofre de cartões por token.
+    * **Debezium Server:** Leitor de log transacional (WAL) que despacha os eventos da tabela `outbox` diretamente para o RabbitMQ sem polling.
+
+---
+
+## 3. Ciclo de Vida do Processamento de Pagamento
+
+```
+[ ms-order ] 
+     |
+     | (Emite evento OrderCreated via CDC)
+     v
+[ RabbitMQ: Exchange order.events (Routing Key: order.created) ]
+     |
+     v
+[ Queue: payment-service.order-created ]
+     |
+     v
+[ payment-ms: OrderCreatedConsumer ]
+     |
+     +---> Desempacota envelope Debezium (schema + payload)
+     |
+     +---> ProcessPaymentUseCase
+              |
+              +-- (1) Checa Idempotência por orderId no repositório.
+              |       Se já processado -> Log informativo + ACK silencioso.
+              |
+              +-- (2) Se método for CREDIT_CARD -> Consulta CardTokenVaultGateway.
+              |       Se PIX / BOLETO -> Segue direto para Gateway.
+              |
+              +-- (3) Criação da Entidade Payment em estado PENDING.
+              |
+              +-- (4) Executa transação via PaymentGateway:
+              |       - Se aprovado -> payment.markAsSucceeded(txnId)
+              |       - Se recusado -> payment.markAsFailed(reason)
+              |
+              +-- (5) Persistência Atômica no PostgreSQL (BEGIN ... COMMIT):
+              |       - INSERT/UPDATE em payments
+              |       - INSERT dos eventos acumulados na tabela outbox
+              |
+              v
+[ PostgreSQL: WAL (Write-Ahead Log) ]
+     |
+     v
+[ Debezium Server: Outbox Event Router ]
+     |
+     v
+[ RabbitMQ: Exchange payment.events ]
+     |
+     +---> payment.succeeded  (Em caso de aprovação)
+     +---> payment.failed     (Em caso de recusa)
+```
+
+---
+
+## 4. Contratos de Dados e Especificação de Eventos
+
+### 4.1. Evento de Entrada Consumido (`order.created`)
+Consumido da exchange `order.events` (suporta envelope nativo do Debezium ou payload plano):
+
+```json
+{
+  "eventName": "OrderCreated",
+  "occurredAt": "2026-09-06T01:15:27.686Z",
+  "orderId": "b0f728fd-e858-4425-8e70-37066257229a",
+  "customerId": "cust-123e4567-e89b-12d3-a456-426614174000",
+  "totalAmount": 520.00,
+  "shippingCost": 20.00,
+  "items": [
+    {
+      "id": "e01ea0c6-ed2d-41e8-a64e-ef50b3b02843",
+      "productId": "prod-headset-gamer",
+      "name": "Headset Gamer 7.1 Surround",
+      "unitPrice": 250.00,
+      "quantity": 2,
+      "subtotal": 500.00
+    }
+  ],
+  "paymentDetails": {
+    "method": "CREDIT_CARD",
+    "paymentMethodId": "tok_visa_12345",
+    "installments": 3
+  },
+  "createdAt": "2026-09-06T01:15:27.685Z"
+}
+```
+
+### 4.2. Eventos Publicados de Saída na Exchange `payment.events`
+
+#### A) Pagamento Aprovado (`routingKey: payment.succeeded`):
+```json
+{
+  "eventName": "payment.succeeded",
+  "occurredAt": "2026-09-06T01:21:20.592Z",
+  "orderId": "b0f728fd-e858-4425-8e70-37066257229a",
+  "paymentId": "b4dff570-98e9-45fa-b5f3-dc5b27901802",
+  "status": "SUCCEEDED",
+  "transactionId": "txn_live_a1b2c3d4e5f67890",
+  "amount": 520.00
+}
+```
+
+#### B) Pagamento Recusado (`routingKey: payment.failed`):
+```json
+{
+  "eventName": "payment.failed",
+  "occurredAt": "2026-09-06T01:21:20.592Z",
+  "orderId": "b0f728fd-e858-4425-8e70-37066257229a",
+  "paymentId": "b4dff570-98e9-45fa-b5f3-dc5b27901802",
+  "status": "FAILED",
+  "reason": "Insufficient funds / Test customer declined",
+  "amount": 520.00
+}
+```
+
+### 4.3. Endpoints da API HTTP (Fastify)
+
+Acesse a documentação interativa em **Swagger UI:** `http://localhost:3001/docs`
+
+| Método | Rota | Descrição |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Status de integridade do PostgreSQL e RabbitMQ |
+| `GET` | `/payments/:id` | Recupera os detalhes do pagamento por UUID |
+| `GET` | `/payments/order/:orderId` | Recupera os dados do pagamento pelo identificador do pedido |
+
+---
+
+## 5. Variáveis de Ambiente
+
+O arquivo `.env.example` traz os valores padrão sanitizados para execução local:
+
+| Variável | Padrão | Descrição |
+| :--- | :--- | :--- |
+| `NODE_ENV` | `development` | Ambiente de execução (`development`, `production`, `test`) |
+| `PORT` | `3001` | Porta HTTP da aplicação (Fastify) |
+| `HOST` | `0.0.0.0` | Host de escuta do servidor HTTP |
+| `DB_HOST` | `localhost` / `payment-postgres` | Host do PostgreSQL |
+| `DB_PORT` | `5432` | Porta interna do PostgreSQL |
+| `DB_USER` | `postgres` | Usuário do banco de dados |
+| `DB_PASSWORD` | `postgres` | Senha do banco de dados |
+| `DB_NAME` | `payment_db` | Nome da base de dados relacional |
+| `DB_POOL_MAX` | `10` | Máximo de conexões no Connection Pool (`pg.Pool`) |
+| `RABBITMQ_HOST` | `localhost` / `rabbitmq` | Host do broker RabbitMQ |
+| `RABBITMQ_PORT` | `5672` | Porta AMQP do RabbitMQ |
+| `RABBITMQ_USER` | `guest` | Usuário AMQP |
+| `RABBITMQ_PASSWORD` | `guest` | Senha AMQP |
+| `RABBITMQ_ORDER_EVENTS_EXCHANGE` | `order.events` | Exchange Topic de entrada dos pedidos |
+| `RABBITMQ_ORDER_CREATED_ROUTING_KEY` | `order.created` | Routing Key para pedidos criados |
+| `RABBITMQ_PAYMENT_QUEUE` | `payment-service.order-created` | Fila durável consumida pelo microsserviço |
+| `RABBITMQ_DLX` | `ecommerce.dlx` | Dead Letter Exchange para falhas não recuperáveis |
+| `RABBITMQ_DLQ` | `payment-service.order-created.dlq` | Fila de Dead Letter |
+| `RABBITMQ_PAYMENT_EVENTS_EXCHANGE` | `payment.events` | Exchange Topic de saída para eventos de pagamento |
+| `GATEWAY_MIN_DELAY_MS` | `300` | Latência mínima simulada no mock de gateway (ms) |
+| `GATEWAY_MAX_DELAY_MS` | `1800` | Latência máxima simulada no mock de gateway (ms) |
+
+---
+
+## 6. Como Executar o Projeto
+
+### Pré-requisitos:
+- [Docker](https://docs.docker.com/get-docker/) instalado e em execução.
+- [Docker Compose](https://docs.docker.com/compose/) v2+.
+- Rede compartilhada externa criada:
+  ```bash
+  docker network create ecommerce-network
+  ```
+
+---
+
+### 6.1. Execução Completa via Docker Compose (Recomendado)
+
+Suba o cluster completo do `payment-ms` (Aplicação, PostgreSQL dedicado na porta `5433` e Debezium Server):
+
+```bash
+docker compose up -d --build
+```
+
+#### Acessos Disponíveis:
+- **API HTTP (Fastify):** [http://localhost:3001](http://localhost:3001)
+- **Documentação OpenAPI / Swagger UI:** [http://localhost:3001/docs](http://localhost:3001/docs)
+- **Healthcheck:** [http://localhost:3001/health](http://localhost:3001/health)
+- **Painel RabbitMQ Management:** [http://localhost:15672](http://localhost:15672) (`guest` / `guest`)
+- **Banco de Dados (DBeaver / PostgreSQL):** Host `localhost`, Porta **`5433`**, Banco `payment_db`, Usuário `postgres`, Senha `postgres`.
+
+---
+
+### 6.2. Execução Local sem Docker (Desenvolvimento)
+
+Caso possua o PostgreSQL e o RabbitMQ rodando localmente:
+
+1. **Instale as dependências:**
+   ```bash
+   npm ci
+   ```
+
+2. **Crie o arquivo de configuração local:**
+   ```bash
+   cp .env.example .env
+   ```
+
+3. **Inicie o servidor em modo de desenvolvimento:**
+   ```bash
+   npm run dev
+   ```
+
+---
+
+### 6.3. Execução dos Testes Automatizados
+
+O repositório possui uma suíte estrita de testes unitários desenvolvida sob o padrão AAA (*Arrange, Act, Assert*) com cobertura superior a 95%:
+
+```bash
+# Executar todos os testes
+npm run test
+
+# Executar com relatório e validação de cobertura (Quality Gate)
+npm run test:cov
+
+# Executar em modo observador contínuo (Watch Mode)
+npm run test:watch
+```
+
+---
+
+### 6.4. Boas Práticas de Versionamento & DevSecOps
+
+O repositório adota políticas rigorosas de segurança, higienização e rastreabilidade para o ciclo de desenvolvimento:
+- **Sanitização de Segredos:** Arquivos `.env` reais, dumps de banco, logs e certificados são permanentemente ignorados via `.gitignore`. Apenas o modelo documentado `.env.example` com valores locais padrão de desenvolvimento é versionado.
+- **Configurações Seguras:** Credenciais em ambientes produtivos devem ser injetadas exclusivamente via variáveis de ambiente seguras (Kubernetes Secrets, AWS Secrets Manager, HashiCorp Vault) e nunca no código-fonte.
+- **Padrão de Commits:** Utiliza a convenção [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`).
+- **Quality Gate:** Testes automatizados executam no build multi-stage do Docker e no pré-commit para impedir que código quebre a cobertura mínima ($\ge 90\%$).
+
+---
+
+## 7. Estrutura de Diretórios do Projeto
+
+```
+payment-ms/
+├── .env.example                       # Modelo de variáveis de ambiente
+├── .dockerignore                      # Arquivos ignorados no build context do Docker
+├── .gitignore                         # Arquivos ignorados no versionamento Git
+├── Dockerfile                         # Build multi-stage (Builder com testes + Runner Alpine)
+├── docker-compose.yml                 # Orquestração (App, PostgreSQL CDC e Debezium Server)
+├── package.json                       # Scripts e dependências (Node 22 LTS)
+├── tsconfig.json                      # Configurações estritas do compilador TypeScript
+├── jest.config.js                     # Configuração de testes unitários e coverage thresholds
+├── GEMINI.md                          # Contexto, regras de IA e diretrizes operacionais
+├── README.md                          # Guia oficial e documentação técnica do projeto
+├── debezium/                          # Configurações do Change Data Capture
+│   └── conf/
+│       └── application.properties     # Conector Quarkus/Debezium para Outbox Router
+├── src/
+│   ├── domain/                        # CAMADA DE DOMÍNIO (Pura, 100% agnóstica)
+│   │   ├── entities/                  # Aggregate Roots e Entidades
+│   │   │   ├── aggregate-root.base.ts # Classe base com suporte a Domain Events
+│   │   │   ├── payment.entity.ts      # Agregado Payment com transições de estado
+│   │   │   └── payment.entity.spec.ts # Testes unitários do agregado
+│   │   ├── value-objects/             # Objetos de Valor Imutáveis
+│   │   │   ├── amount.vo.ts           # VO Amount com validação estrita
+│   │   │   └── amount.vo.spec.ts      # Testes unitários do VO
+│   │   ├── events/                    # Eventos de Domínio
+│   │   │   ├── domain-event.interface.ts
+│   │   │   ├── payment-succeeded.event.ts
+│   │   │   └── payment-failed.event.ts
+│   │   ├── errors/                    # Exceções de Regras de Domínio
+│   │   │   ├── domain.error.ts
+│   │   │   └── domain.error.spec.ts
+│   │   └── index.ts
+│   ├── application/                   # CAMADA DE APLICAÇÃO (Casos de Uso e Portas)
+│   │   ├── ports/                     # Portas de Saída (Abstrações / Gateways)
+│   │   │   ├── payment.repository.interface.ts
+│   │   │   ├── payment.gateway.interface.ts
+│   │   │   └── card-token-vault.gateway.interface.ts
+│   │   ├── dtos/                      # Data Transfer Objects planos
+│   │   │   ├── process-payment.dto.ts
+│   │   │   └── get-payment.dto.ts
+│   │   ├── use-cases/                 # Orquestradores de fluxo
+│   │   │   ├── process-payment.use-case.ts
+│   │   │   ├── process-payment.use-case.spec.ts
+│   │   │   ├── get-payment-by-id.use-case.ts
+│   │   │   ├── get-payment-by-id.use-case.spec.ts
+│   │   │   ├── get-payment-by-order-id.use-case.ts
+│   │   │   └── get-payment-by-order-id.use-case.spec.ts
+│   │   ├── errors/                    # Exceções de Aplicação
+│   │   │   ├── application.error.ts
+│   │   │   └── application.error.spec.ts
+│   │   └── index.ts
+│   ├── adapters/                      # ADAPTADORES PRIMÁRIOS (Driving / Inbound)
+│   │   ├── messaging/                 # Consumidores AMQP RabbitMQ
+│   │   │   ├── order-created.consumer.ts      # Consumidor com suporte a DLQ e CDC
+│   │   │   └── order-created.consumer.spec.ts # Testes do consumidor
+│   │   └── http/                      # Interface Web Fastify
+│   │       ├── controllers/           # Controladores HTTP
+│   │       │   ├── payment.controller.ts
+│   │       │   ├── payment.controller.spec.ts
+│   │       │   ├── health.controller.ts
+│   │       │   └── health.controller.spec.ts
+│   │       └── routes/                # Definição e schemas OpenAPI
+│   │           ├── payment.routes.ts
+│   │           └── health.routes.ts
+│   ├── infra/                         # ADAPTADORES SECUNDÁRIOS (Driven / Outbound)
+│   │   ├── config/                    # Variáveis de ambiente fortemente tipadas
+│   │   │   └── env.ts
+│   │   ├── database/                  # Persistência e Mappers
+│   │   │   ├── schema.sql             # DDL das tabelas payments e outbox
+│   │   │   ├── postgres.pool.ts       # Singleton gerenciador do pg.Pool
+│   │   │   ├── postgres.pool.spec.ts
+│   │   │   ├── payment.mapper.ts      # Conversor tabular <-> domínio
+│   │   │   ├── payment.mapper.spec.ts
+│   │   │   ├── postgres-payment.repository.ts # Repositório com transação atômica Outbox
+│   │   │   └── postgres-payment.repository.spec.ts
+│   │   ├── gateways/                  # Mocks de Integrações Externas
+│   │   │   ├── mock-payment.gateway.ts        # Gateway com latência e falha determinística
+│   │   │   ├── mock-payment.gateway.spec.ts
+│   │   │   ├── mock-card-token-vault.gateway.ts # Cofre de tokens de cartões
+│   │   │   └── mock-card-token-vault.gateway.spec.ts
+│   │   ├── messaging/                 # Infraestrutura AMQP
+│   │   │   ├── rabbitmq.connection.ts         # Singleton resiliente de conexão AMQP
+│   │   │   └── rabbitmq.connection.spec.ts
+│   │   └── http/                      # Setup Fastify e Plugins
+│   │       ├── app.ts                 # Composition da aplicação Fastify + Swagger
+│   │       └── app.spec.ts            # Testes de integração HTTP
+│   └── main.ts                        # Composition Root e Entrypoint da aplicação
+```
+
+---
+
+## 8. Próximos Passos do Laboratório (Roadmap)
+
+- [x] **Transactional Outbox Pattern com Debezium CDC:** Implementado com replicação lógica no PostgreSQL e sink RabbitMQ.
+- [x] **Tratamento de Idempotência e Desempacotamento de Envelopes:** Resolução atômica de duplicações e suporte transparente a payloads envelopados do Debezium.
+- [x] **Topologia Resiliente com Dead Letter Queue (DLQ):** Fila `payment-service.order-created.dlq` associada via `ecommerce.dlx`.
+- [ ] **Testes de Integração Automatizados (E2E) com Testcontainers:** Testar a cadeia completa (PostgreSQL + RabbitMQ reais) em ambiente isolado de CI/CD.
+- [ ] **Integração com Microsserviço de Notificações (`notification-ms`):** Ouvir `payment.succeeded` e `payment.failed` para envio de e-mails/push aos clientes.
+- [ ] **Observabilidade com OpenTelemetry & Prometheus:** Coleta de métricas de latência e tracing distribuído entre `order-ms` e `payment-ms`.
