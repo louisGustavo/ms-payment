@@ -1,0 +1,95 @@
+services:
+  # Aplicação Principal: payment-ms
+  payment-ms:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ms-payment-app
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - HOST=0.0.0.0
+      - DB_HOST=payment-postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=payment_db
+      - DB_POOL_MAX=10
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_ORDER_EVENTS_EXCHANGE=order.events
+      - RABBITMQ_ORDER_CREATED_ROUTING_KEY=order.created
+      - RABBITMQ_PAYMENT_QUEUE=payment-service.order-created
+      - RABBITMQ_DLX=ecommerce.dlx
+      - RABBITMQ_DLQ=payment-service.order-created.dlq
+      - RABBITMQ_PAYMENT_EVENTS_EXCHANGE=payment.events
+      - GATEWAY_MIN_DELAY_MS=300
+      - GATEWAY_MAX_DELAY_MS=1800
+    depends_on:
+      payment-postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # Banco de Dados Relacional PostgreSQL (com CDC e Replicação Lógica ativados)
+  payment-postgres:
+    image: postgres:16-alpine
+    container_name: ms-payment-postgres
+    restart: unless-stopped
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5"]
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=payment_db
+    ports:
+      - "5433:5432" # Porta externa 5433 para não conflitar com banco de order-ms se estiver rodando
+    volumes:
+      - payment_postgres_data:/var/lib/postgresql/data
+      - ./src/infra/database/schema.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payment_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce-network
+
+  # Debezium Server (CDC Runner do payment-ms para RabbitMQ)
+  payment-debezium:
+    image: quay.io/debezium/server:2.5.4.Final
+    container_name: ms-payment-debezium
+    restart: unless-stopped
+    environment:
+      - DB_HOST=payment-postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=payment_db
+      - SERVICE_NAME=payment-ms
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASSWORD=guest
+      - RABBITMQ_EXCHANGE=payment.events
+      - RABBITMQ_ROUTING_KEY=payment.events
+    volumes:
+      - ./debezium/conf:/debezium/conf:ro
+      - payment_debezium_data:/debezium/data
+    depends_on:
+      payment-postgres:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+networks:
+  ecommerce-network:
+    external: true
+
+volumes:
+  payment_postgres_data:
+  payment_debezium_data:
