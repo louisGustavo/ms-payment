@@ -8,6 +8,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
 ![Fastify](https://img.shields.io/badge/Fastify-5.x-000000?style=for-the-badge&logo=fastify&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=for-the-badge&logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-7_Alpine-DC382D?style=for-the-badge&logo=redis&logoColor=white)
 ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3.x-FF6600?style=for-the-badge&logo=rabbitmq&logoColor=white)
 ![Debezium](https://img.shields.io/badge/Debezium-CDC_Outbox-red?style=for-the-badge&logo=apache-kafka&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Multi--stage-2496ED?style=for-the-badge&logo=docker&logoColor=white)
@@ -21,10 +22,11 @@ O **`payment-ms`** é um microsserviço de processamento de pagamentos integrant
 
 ### Principais Responsabilidades:
 1. **Consumo Confiável:** Consumir eventos `order.created` emitidos pelo ecossistema na exchange `order.events`.
-2. **Garantia de Idempotência:** Prevenir cobranças duplicadas para o mesmo `orderId`, garantindo processamento atômico e seguro.
-3. **Isolamento de Negócio (DDD):** Modelar o ciclo de vida do pagamento (`Payment` Aggregate Root) com regras invariantes estritas e transições de estado ricas (`PENDING` $\rightarrow$ `SUCCEEDED` ou `FAILED`).
-4. **Resiliência Transacional (Transactional Outbox Pattern):** Persistir o estado do pagamento e os eventos de saída de forma atômica no PostgreSQL (`BEGIN ... COMMIT`), delegando o despacho ao RabbitMQ para o **Debezium Server (CDC)** via WAL (`pgoutput`).
-5. **Notificação do Ecossistema:** Publicar os eventos de resultado `payment.succeeded` ou `payment.failed` na exchange dedicada `payment.events`.
+2. **Lock Distribuído & Concorrência (Redis):** Prevenir *Race Conditions* e cobranças duplicadas em réplicas simultâneas de consumidores via lock atômico por recurso (`lock:payment:order:<orderId>`).
+3. **Garantia de Idempotência:** Prevenir cobranças duplicadas para o mesmo `orderId`, garantindo processamento atômico e seguro.
+4. **Isolamento de Negócio (DDD):** Modelar o ciclo de vida do pagamento (`Payment` Aggregate Root) com regras invariantes estritas e transições de estado ricas (`PENDING` $\rightarrow$ `SUCCEEDED` ou `FAILED`).
+5. **Resiliência Transacional (Transactional Outbox Pattern):** Persistir o estado do pagamento e os eventos de saída de forma atômica no PostgreSQL (`BEGIN ... COMMIT`), delegando o despacho ao RabbitMQ para o **Debezium Server (CDC)** via WAL (`pgoutput`).
+6. **Notificação do Ecossistema:** Publicar os eventos de resultado `payment.succeeded` ou `payment.failed` na exchange dedicada `payment.events`.
 
 ---
 
@@ -65,18 +67,19 @@ A aplicação segue rigorosamente os preceitos da **Clean Architecture** (Robert
   * **Domain Errors:** Hierarquia de exceções de negócio tipadas (`DomainValidationError`, `PaymentAlreadyFinalizedError`).
 
 * **`Application` (`src/application/`):**
-  * Orquestra as operações de negócio sem conhecer detalhes de banco de dados ou mensageria.
+  * Orquestra as operações de negócio sem conhecer detalhes de banco de dados, Redis ou mensageria.
   * **Casos de Uso:** `ProcessPaymentUseCase`, `GetPaymentByIdUseCase`, `GetPaymentByOrderIdUseCase`.
-  * **Portas de Saída (Ports):** Interfaces abstratas `PaymentRepository`, `PaymentGateway`, `CardTokenVaultGateway`.
+  * **Portas de Saída (Ports):** Interfaces abstratas `PaymentRepository`, `PaymentGateway`, `CardTokenVaultGateway` e `DistributedLockService`.
   * **Princípio da Inversão de Dependência (DIP):** O caso de uso depende apenas das portas, não de classes concretas.
 
 * **`Adapters` (`src/adapters/`):**
   * Adaptadores primários (driving):
-    * **RabbitMQ Consumer (`order-created.consumer.ts`):** Escuta a fila `payment-service.order-created`, desempacota envelopes CDC e encaminha ao caso de uso.
+    * **RabbitMQ Consumer (`order-created.consumer.ts`):** Escuta a fila `payment-service.order-created`, desempacota envelopes CDC, adquire lock distribuído exclusivo e encaminha ao caso de uso.
     * **Controladores HTTP (`payment.controller.ts`, `health.controller.ts`):** Exposição REST e healthcheck liveness/readiness.
 
 * **`Infrastructure` (`src/infra/`):**
   * Adaptadores secundários (driven):
+    * **`RedisDistributedLockService` (`src/infra/concurrency/`):** Implementação de lock atômico (`SET NX PX`) e liberação segura via script Lua com `ioredis`.
     * **`PostgresPaymentRepository`:** Persistência relacional atômica da entidade e escrita dos eventos na tabela `outbox`.
     * **`MockPaymentGateway`:** Simulação financeira com latência realista (300ms a 1800ms) e regra de falha determinística para testes (`customerId === "teste-123"`).
     * **`MockCardTokenVaultGateway`:** Simulação de cofre de cartões por token.
@@ -101,6 +104,10 @@ A aplicação segue rigorosamente os preceitos da **Clean Architecture** (Robert
      |
      +---> Desempacota envelope Debezium (schema + payload)
      |
+     +---> Adquire Lock Distribuído no Redis: 'lock:payment:order:<orderId>'
+     |     - Se Ocupado (Concorrência detectada) -> Log informativo + ACK (descarte seguro)
+     |     - Se Adquirido -> Segue para execução em bloco try/finally
+     |
      +---> ProcessPaymentUseCase
               |
               +-- (1) Checa Idempotência por orderId no repositório.
@@ -120,6 +127,9 @@ A aplicação segue rigorosamente os preceitos da **Clean Architecture** (Robert
               |       - INSERT dos eventos acumulados na tabela outbox
               |
               v
+[ Finally: Libera Lock Distribuído no Redis (Script Lua atômico checando token) ]
+     |
+     v
 [ PostgreSQL: WAL (Write-Ahead Log) ]
      |
      v
@@ -233,6 +243,10 @@ O arquivo `.env.example` traz os valores padrão sanitizados para execução loc
 | `RABBITMQ_PAYMENT_EVENTS_EXCHANGE` | `payment.events` | Exchange Topic de saída para eventos de pagamento |
 | `GATEWAY_MIN_DELAY_MS` | `300` | Latência mínima simulada no mock de gateway (ms) |
 | `GATEWAY_MAX_DELAY_MS` | `1800` | Latência máxima simulada no mock de gateway (ms) |
+| `REDIS_HOST` | `localhost` / `payment-redis` | Host do servidor Redis |
+| `REDIS_PORT` | `6379` | Porta de conexão do Redis |
+| `REDIS_PASSWORD` | `""` | Senha do Redis (opcional) |
+| `DISTRIBUTED_LOCK_TTL_MS` | `10000` | Tempo de vida (TTL) do Lock Distribuído em ms |
 
 ---
 
@@ -250,7 +264,7 @@ O arquivo `.env.example` traz os valores padrão sanitizados para execução loc
 
 ### 6.1. Execução Completa via Docker Compose (Recomendado)
 
-Suba o cluster completo do `payment-ms` (Aplicação, PostgreSQL dedicado na porta `5433` e Debezium Server):
+Suba o cluster completo do `payment-ms` (Aplicação, PostgreSQL dedicado na porta `5433`, Redis na porta `6379` e Debezium Server):
 
 ```bash
 docker compose up -d --build
@@ -260,6 +274,7 @@ docker compose up -d --build
 - **API HTTP (Fastify):** [http://localhost:3001](http://localhost:3001)
 - **Documentação OpenAPI / Swagger UI:** [http://localhost:3001/docs](http://localhost:3001/docs)
 - **Healthcheck:** [http://localhost:3001/health](http://localhost:3001/health)
+- **Redis (Redis Insight / CLI):** Host `localhost`, Porta **`6379`**
 - **Painel RabbitMQ Management:** [http://localhost:15672](http://localhost:15672) (`guest` / `guest`)
 - **Banco de Dados (DBeaver / PostgreSQL):** Host `localhost`, Porta **`5433`**, Banco `payment_db`, Usuário `postgres`, Senha `postgres`.
 
@@ -351,7 +366,8 @@ payment-ms/
 │   │   ├── ports/                     # Portas de Saída (Abstrações / Gateways)
 │   │   │   ├── payment.repository.interface.ts
 │   │   │   ├── payment.gateway.interface.ts
-│   │   │   └── card-token-vault.gateway.interface.ts
+│   │   │   ├── card-token-vault.gateway.interface.ts
+│   │   │   └── distributed-lock.service.ts    # Porta de Lock Distribuído
 │   │   ├── dtos/                      # Data Transfer Objects planos
 │   │   │   ├── process-payment.dto.ts
 │   │   │   └── get-payment.dto.ts
@@ -368,7 +384,7 @@ payment-ms/
 │   │   └── index.ts
 │   ├── adapters/                      # ADAPTADORES PRIMÁRIOS (Driving / Inbound)
 │   │   ├── messaging/                 # Consumidores AMQP RabbitMQ
-│   │   │   ├── order-created.consumer.ts      # Consumidor com suporte a DLQ e CDC
+│   │   │   ├── order-created.consumer.ts      # Consumidor com suporte a Lock, DLQ e CDC
 │   │   │   └── order-created.consumer.spec.ts # Testes do consumidor
 │   │   └── http/                      # Interface Web Fastify
 │   │       ├── controllers/           # Controladores HTTP
@@ -382,6 +398,9 @@ payment-ms/
 │   ├── infra/                         # ADAPTADORES SECUNDÁRIOS (Driven / Outbound)
 │   │   ├── config/                    # Variáveis de ambiente fortemente tipadas
 │   │   │   └── env.ts
+│   │   ├── concurrency/               # Lock Distribuído e Controle de Concorrência
+│   │   │   ├── redis-distributed-lock.service.ts      # Engine atômica com ioredis e script Lua
+│   │   │   └── redis-distributed-lock.service.spec.ts # Testes unitários do lock
 │   │   ├── database/                  # Persistência e Mappers
 │   │   │   ├── schema.sql             # DDL das tabelas payments e outbox
 │   │   │   ├── postgres.pool.ts       # Singleton gerenciador do pg.Pool
@@ -409,8 +428,9 @@ payment-ms/
 ## 8. Próximos Passos do Laboratório (Roadmap)
 
 - [x] **Transactional Outbox Pattern com Debezium CDC:** Implementado com replicação lógica no PostgreSQL e sink RabbitMQ.
+- [x] **Lock Distribuído com Redis:** Prevenção de race conditions e dupla cobrança em réplicas simultâneas via comando atômico `SET NX PX` e liberação Lua segura.
 - [x] **Tratamento de Idempotência e Desempacotamento de Envelopes:** Resolução atômica de duplicações e suporte transparente a payloads envelopados do Debezium.
 - [x] **Topologia Resiliente com Dead Letter Queue (DLQ):** Fila `payment-service.order-created.dlq` associada via `ecommerce.dlx`.
-- [ ] **Testes de Integração Automatizados (E2E) com Testcontainers:** Testar a cadeia completa (PostgreSQL + RabbitMQ reais) em ambiente isolado de CI/CD.
+- [ ] **Testes de Integração Automatizados (E2E) com Testcontainers:** Testar a cadeia completa (PostgreSQL + RabbitMQ + Redis reais) em ambiente isolado de CI/CD.
 - [ ] **Integração com Microsserviço de Notificações (`notification-ms`):** Ouvir `payment.succeeded` e `payment.failed` para envio de e-mails/push aos clientes.
 - [ ] **Observabilidade com OpenTelemetry & Prometheus:** Coleta de métricas de latência e tracing distribuído entre `order-ms` e `payment-ms`.

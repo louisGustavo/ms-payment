@@ -30,9 +30,29 @@ services:
       - RABBITMQ_PAYMENT_EVENTS_EXCHANGE=payment.events
       - GATEWAY_MIN_DELAY_MS=300
       - GATEWAY_MAX_DELAY_MS=1800
+      - REDIS_HOST=payment-redis
+      - REDIS_PORT=6379
+      - DISTRIBUTED_LOCK_TTL_MS=10000
     depends_on:
       payment-postgres:
         condition: service_healthy
+      payment-redis:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+
+  # Redis para Lock Distribuído e Coordenação de Concorrência
+  payment-redis:
+    image: redis:7-alpine
+    container_name: ms-payment-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     networks:
       - ecommerce-network
 

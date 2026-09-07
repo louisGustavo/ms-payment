@@ -10,6 +10,7 @@ import { GetPaymentByIdUseCase } from '@application/use-cases/get-payment-by-id.
 import { GetPaymentByOrderIdUseCase } from '@application/use-cases/get-payment-by-order-id.use-case';
 import { PaymentController } from '@adapters/http/controllers/payment.controller';
 import { RabbitMQConnection } from '@infra/messaging/rabbitmq.connection';
+import { RedisDistributedLockService } from '@infra/concurrency/redis-distributed-lock.service';
 import { OrderCreatedConsumer } from '@adapters/messaging/order-created.consumer';
 import { buildApp } from '@infra/http/app';
 
@@ -38,6 +39,13 @@ async function bootstrap() {
   const paymentGateway = new MockPaymentGateway();
   const cardTokenVaultGateway = new MockCardTokenVaultGateway();
 
+  // Instanciação do Lock Distribuído via Redis para coordenação de concorrência
+  const redisLockService = new RedisDistributedLockService({
+    host: env.REDIS_HOST,
+    port: env.REDIS_PORT,
+    password: env.REDIS_PASSWORD || undefined,
+  });
+
   // 3. Instanciação dos Casos de Uso
   const processPaymentUseCase = new ProcessPaymentUseCase({
     paymentRepository,
@@ -57,7 +65,7 @@ async function bootstrap() {
   const rmq = RabbitMQConnection.getInstance();
   try {
     const channel = await rmq.connect();
-    const consumer = new OrderCreatedConsumer(channel, processPaymentUseCase);
+    const consumer = new OrderCreatedConsumer(channel, processPaymentUseCase, redisLockService);
     await consumer.start();
     console.info('[Bootstrap] RabbitMQ Consumer conectado e escutando eventos order.created.');
   } catch (err) {
@@ -87,6 +95,7 @@ async function bootstrap() {
     try {
       await app.close();
       await rmq.close();
+      await redisLockService.close();
       await postgresPool.close();
       console.info('[Bootstrap] Recursos finalizados com sucesso. Encerrando processo.');
       process.exit(0);

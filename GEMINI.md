@@ -26,6 +26,7 @@ O `payment-ms` é um microsserviço de alta criticidade responsável pelo proces
 | **Web Framework** | Fastify | v5.2.x com `@fastify/swagger` e `@fastify/swagger-ui` |
 | **Banco de Dados** | PostgreSQL | v16 com replicação lógica habilitada (`wal_level=logical`) |
 | **Driver de BD** | `pg` | Pool de conexões nativo com transações explícitas |
+| **Coordenação de Concorrência** | Redis | v7-alpine com `ioredis` para Lock Distribuído |
 | **Mensageria** | RabbitMQ | v3.13 com AMQP 0-9-1 (`amqplib`) |
 | **CDC Engine** | Debezium Server | v2.6.x (Quarkus runtime) |
 | **Testes** | Jest + ts-jest | v29.x com threshold de cobertura $\ge 90\%$ |
@@ -114,6 +115,16 @@ Para evitar problemas de *Dual-Write* (inconsistência entre banco de dados e me
 - Headers enriquecidos (`x-exception-message`, `x-original-exchange`, `x-original-routing-key`, `x-failed-at`) são anexados para permitir triagem e auditoria.
 - **Idempotência**: O processamento verifica unicidade pelo `orderId`. Se o pagamento já existir para aquele pedido, a mensagem é descartada com `ack` sem reprocessamento duplicado.
 
+### 4.5. Lock Distribuído com Redis (Prevenção de Race Conditions)
+Para impedir que múltiplas instâncias consumindo o RabbitMQ processem o mesmo pedido simultaneamente (causando cobranças duplicadas no gateway adquirente):
+- **Porta Agnóstica**: Definida na camada de aplicação via `DistributedLockService` (`acquire` / `release`).
+- **Implementação Segura (`src/infra/concurrency/redis-distributed-lock.service.ts`)**:
+  - Utiliza `ioredis` executando `SET lock:payment:order:<orderId> <token> NX PX <ttlMs>` atomicamente.
+  - Gera um identificador exclusivo de posse (`crypto.randomUUID()`).
+  - Libera o lock através de **script Lua atômico** que checa se a chave retém o mesmo token do processo antes de executar o `DEL`.
+- **Mitigação de Concorrência**: Se a tentativa de aquisição retornar `null`, a instância descarta a mensagem duplicada com `ack` e registra advertência em log, garantindo que apenas a instância detentora execute a cobrança.
+- **Liberação Garantida**: A invocação do caso de uso reside dentro de um bloco `try/finally`, liberando o lock imediatamente após o processamento.
+
 ---
 
 ## 5. Estrutura de Diretórios e Nomenclaturas
@@ -142,19 +153,18 @@ payment-ms/
     │   └── errors/             # Exceções de regras de negócio
     ├── application/
     │   ├── use-cases/          # Casos de uso de negócio
-    │   ├── ports/              # Interfaces de repositórios e gateways externos
+    │   ├── ports/              # Interfaces de repositórios, gateways e lock distribuído
     │   ├── dtos/               # Contratos de entrada e saída
     │   └── errors/             # Erros de aplicação
     ├── adapters/
-    │   ├── controllers/        # Controladores HTTP Fastify
-    │   ├── consumers/          # Consumidores AMQP RabbitMQ
-    │   ├── routes/             # Definição de rotas HTTP
-    │   └── mappers/            # Conversores entre Domínio e Persistência
+    │   ├── http/               # Controladores HTTP Fastify e rotas
+    │   └── messaging/          # Consumidores AMQP RabbitMQ (order-created.consumer.ts)
     └── infra/
-        ├── database/           # Pool PostgreSQL e migrations (schema.sql)
-        ├── repositories/       # Implementação do repositório com Outbox atômico
+        ├── config/             # Configurações de ambiente tipadas (env.ts)
+        ├── concurrency/        # Lock Distribuído com Redis (redis-distributed-lock.service.ts)
+        ├── database/           # Pool PostgreSQL e migrations (schema.sql, repositórios)
         ├── messaging/          # Conexão RabbitMQ e topologias
-        ├── gateways/           # Implementações de gateways (mocks)
+        ├── gateways/           # Implementações de gateways e cofres (mocks)
         └── http/               # Configuração do servidor Fastify e plugins Swagger
 ```
 
@@ -181,6 +191,7 @@ Para evitar conflito com o `order-ms` no mesmo host de desenvolvimento:
 | :--- | :--- | :--- | :--- |
 | **payment-ms (HTTP)** | **`3001`** | `3001` | (`order-ms` utiliza a porta 3000) |
 | **PostgreSQL (payment_db)** | **`5433`** | `5432` | (`order-ms` utiliza a porta 5432) |
+| **Redis (Distributed Lock)**| **`6379`** | `6379` | Coordenação de concorrência (`payment-redis`) |
 | **RabbitMQ AMQP** | `5672` | `5672` | Rede Docker `ecommerce-network` |
 | **RabbitMQ Management** | `15672` | `15672` | Painel Web: `http://localhost:15672` (guest/guest) |
 | **Debezium CDC Runner** | - | - | Container interno conectado à rede compartilhada |
@@ -262,3 +273,7 @@ Ao editar, estender ou refatorar o código deste repositório, os agentes **DEVE
    - Toda nova variável de configuração deve ser adicionada à interface tipada em `src/infra/config/env.ts` e documentada no `.env.example` com valores padrão seguros de desenvolvimento.
    - Preserve as regras do `.gitignore` para impedir que `dist/`, `coverage/`, `.env` ou logs sejam acidentalmente versionados.
    - Adote o padrão de mensagens **Conventional Commits** (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`).
+8. **Lock Distribuído e Concorrência**:
+   - Nunca importe a biblioteca do Redis (`ioredis`) dentro de `@domain/*` ou `@application/*`. Toda coordenação de concorrência deve passar pela abstração `DistributedLockService`.
+   - Garanta que todo lock adquirido seja liberado com script Lua seguro dentro de um bloco `finally`.
+

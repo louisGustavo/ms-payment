@@ -28,10 +28,12 @@
     "amqplib": "^0.10.5",
     "dotenv": "^16.4.7",
     "fastify": "^5.2.1",
+    "ioredis": "^6.0.0",
     "pg": "^8.13.3"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.6",
+    "@types/ioredis": "^4.28.10",
     "@types/jest": "^29.5.14",
     "@types/node": "^22.13.9",
     "@types/pg": "^8.11.11",

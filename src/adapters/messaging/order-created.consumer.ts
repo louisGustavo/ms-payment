@@ -1,5 +1,6 @@
 import { Channel, ConsumeMessage } from 'amqplib';
 import { ProcessPaymentUseCase } from '@application/use-cases/process-payment.use-case';
+import { DistributedLockService } from '@application/ports/distributed-lock.service';
 import { env } from '@infra/config/env';
 
 export interface OrderCreatedPayload {
@@ -28,7 +29,8 @@ export interface OrderCreatedPayload {
 export class OrderCreatedConsumer {
   constructor(
     private readonly channel: Channel,
-    private readonly processPaymentUseCase: ProcessPaymentUseCase
+    private readonly processPaymentUseCase: ProcessPaymentUseCase,
+    private readonly distributedLockService: DistributedLockService
   ) {}
 
   public async setupTopology(): Promise<void> {
@@ -118,29 +120,46 @@ export class OrderCreatedConsumer {
       return;
     }
 
-    console.info(`[OrderCreatedConsumer] Processando cobrança do pedido '${payload.orderId}'...`);
+    // Controle de Concorrência Distribuída (Lock por recurso de Pedido)
+    const lockResource = `lock:payment:order:${payload.orderId}`;
+    const lockTtl = env.DISTRIBUTED_LOCK_TTL_MS;
+    const lockToken = await this.distributedLockService.acquire(lockResource, lockTtl);
 
-    const result = await this.processPaymentUseCase.execute({
-      orderId: payload.orderId,
-      customerId: payload.customerId,
-      totalAmount: payload.totalAmount,
-      shippingCost: payload.shippingCost,
-      paymentDetails: {
-        method: payload.paymentDetails?.method ?? '',
-        paymentMethodId: payload.paymentDetails?.paymentMethodId,
-        installments: payload.paymentDetails?.installments,
-      },
-    });
-
-    if (result.isDuplicate) {
-      console.info(`[OrderCreatedConsumer] Pedido '${payload.orderId}' já foi processado anteriormente (Idempotência).`);
-    } else {
-      console.info(
-        `[OrderCreatedConsumer] Pagamento '${result.paymentId}' concluído com status: ${result.status}`
+    if (!lockToken) {
+      console.warn(
+        `[OrderCreatedConsumer] Concorrência detectada: Lock '${lockResource}' já retido por outra instância. Descartando mensagem concorrente com ACK para evitar cobrança duplicada.`
       );
+      this.channel.ack(msg);
+      return;
     }
 
-    // Confirmação com sucesso
-    this.channel.ack(msg);
+    try {
+      console.info(`[OrderCreatedConsumer] Processando cobrança do pedido '${payload.orderId}'...`);
+
+      const result = await this.processPaymentUseCase.execute({
+        orderId: payload.orderId,
+        customerId: payload.customerId,
+        totalAmount: payload.totalAmount,
+        shippingCost: payload.shippingCost,
+        paymentDetails: {
+          method: payload.paymentDetails?.method ?? '',
+          paymentMethodId: payload.paymentDetails?.paymentMethodId,
+          installments: payload.paymentDetails?.installments,
+        },
+      });
+
+      if (result.isDuplicate) {
+        console.info(`[OrderCreatedConsumer] Pedido '${payload.orderId}' já foi processado anteriormente (Idempotência).`);
+      } else {
+        console.info(
+          `[OrderCreatedConsumer] Pagamento '${result.paymentId}' concluído com status: ${result.status}`
+        );
+      }
+
+      // Confirmação com sucesso
+      this.channel.ack(msg);
+    } finally {
+      await this.distributedLockService.release(lockResource, lockToken);
+    }
   }
 }

@@ -32,6 +32,12 @@ export interface Environment {
   // Latência do Gateway Mock
   readonly GATEWAY_MIN_DELAY_MS: number;
   readonly GATEWAY_MAX_DELAY_MS: number;
+
+  // Redis & Lock Distribuído
+  readonly REDIS_HOST: string;
+  readonly REDIS_PORT: number;
+  readonly REDIS_PASSWORD: string;
+  readonly DISTRIBUTED_LOCK_TTL_MS: number;
 }
 
 export const env: Environment = {
@@ -60,4 +66,9 @@ export const env: Environment = {
 
   GATEWAY_MIN_DELAY_MS: parseInt(process.env['GATEWAY_MIN_DELAY_MS'] || '300', 10),
   GATEWAY_MAX_DELAY_MS: parseInt(process.env['GATEWAY_MAX_DELAY_MS'] || '1800', 10),
+
+  REDIS_HOST: process.env['REDIS_HOST'] || 'localhost',
+  REDIS_PORT: parseInt(process.env['REDIS_PORT'] || '6379', 10),
+  REDIS_PASSWORD: process.env['REDIS_PASSWORD'] || '',
+  DISTRIBUTED_LOCK_TTL_MS: parseInt(process.env['DISTRIBUTED_LOCK_TTL_MS'] || '10000', 10),
 };

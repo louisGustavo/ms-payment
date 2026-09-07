@@ -1,10 +1,12 @@
 import { OrderCreatedConsumer } from './order-created.consumer';
 import { ProcessPaymentUseCase } from '@application/use-cases/process-payment.use-case';
+import { DistributedLockService } from '@application/ports/distributed-lock.service';
 import { Channel, ConsumeMessage } from 'amqplib';
 
 describe('OrderCreatedConsumer', () => {
   let mockChannel: jest.Mocked<Partial<Channel>>;
   let mockUseCase: jest.Mocked<Partial<ProcessPaymentUseCase>>;
+  let mockLockService: jest.Mocked<DistributedLockService>;
   let consumer: OrderCreatedConsumer;
 
   const validPayload = {
@@ -58,9 +60,15 @@ describe('OrderCreatedConsumer', () => {
       }),
     };
 
+    mockLockService = {
+      acquire: jest.fn().mockResolvedValue('mock-token-uuid-1234'),
+      release: jest.fn().mockResolvedValue(true),
+    };
+
     consumer = new OrderCreatedConsumer(
       mockChannel as unknown as Channel,
-      mockUseCase as unknown as ProcessPaymentUseCase
+      mockUseCase as unknown as ProcessPaymentUseCase,
+      mockLockService
     );
   });
 
@@ -98,11 +106,13 @@ describe('OrderCreatedConsumer', () => {
     expect(mockChannel.nack).toHaveBeenCalledWith(errorMsg, false, false);
   });
 
-  it('deve processar mensagem válida e confirmar com ACK', async () => {
+  it('deve processar mensagem válida, adquirindo o lock e liberando no finally, e confirmando com ACK', async () => {
     const msg = createMockMessage(validPayload);
 
     await consumer.handleMessage(msg);
 
+    const expectedLockResource = `lock:payment:order:${validPayload.orderId}`;
+    expect(mockLockService.acquire).toHaveBeenCalledWith(expectedLockResource, expect.any(Number));
     expect(mockUseCase.execute).toHaveBeenCalledWith({
       orderId: validPayload.orderId,
       customerId: validPayload.customerId,
@@ -114,8 +124,41 @@ describe('OrderCreatedConsumer', () => {
         installments: 3,
       },
     });
+    expect(mockLockService.release).toHaveBeenCalledWith(expectedLockResource, 'mock-token-uuid-1234');
     expect(mockChannel.ack).toHaveBeenCalledWith(msg);
     expect(mockChannel.nack).not.toHaveBeenCalled();
+  });
+
+  it('deve descartar com ACK e registrar aviso quando o lock distribuído NÃO for adquirido (concorrência detectada)', async () => {
+    mockLockService.acquire.mockResolvedValueOnce(null);
+    const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const msg = createMockMessage(validPayload);
+    await consumer.handleMessage(msg);
+
+    const expectedLockResource = `lock:payment:order:${validPayload.orderId}`;
+    expect(mockLockService.acquire).toHaveBeenCalledWith(expectedLockResource, expect.any(Number));
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Concorrência detectada: Lock 'lock:payment:order:")
+    );
+    expect(mockUseCase.execute).not.toHaveBeenCalled();
+    expect(mockLockService.release).not.toHaveBeenCalled();
+    expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+    expect(mockChannel.nack).not.toHaveBeenCalled();
+
+    consoleWarnSpy.mockRestore();
+  });
+
+  it('deve garantir que o lock é liberado mesmo se o caso de uso lançar exceção', async () => {
+    mockUseCase.execute = jest.fn().mockRejectedValueOnce(new Error('Falha no gateway'));
+    const msg = createMockMessage(validPayload);
+
+    const expectedLockResource = `lock:payment:order:${validPayload.orderId}`;
+
+    await expect(consumer.handleMessage(msg)).rejects.toThrow('Falha no gateway');
+
+    expect(mockLockService.acquire).toHaveBeenCalledWith(expectedLockResource, expect.any(Number));
+    expect(mockLockService.release).toHaveBeenCalledWith(expectedLockResource, 'mock-token-uuid-1234');
   });
 
   it('deve processar mensagem encapsulada no envelope CDC do Debezium (payload como string JSON)', async () => {
@@ -138,6 +181,7 @@ describe('OrderCreatedConsumer', () => {
         totalAmount: validPayload.totalAmount,
       })
     );
+    expect(mockLockService.release).toHaveBeenCalled();
     expect(mockChannel.ack).toHaveBeenCalledWith(msg);
   });
 
@@ -155,6 +199,7 @@ describe('OrderCreatedConsumer', () => {
         orderId: validPayload.orderId,
       })
     );
+    expect(mockLockService.release).toHaveBeenCalled();
     expect(mockChannel.ack).toHaveBeenCalledWith(msg);
   });
 
@@ -170,18 +215,20 @@ describe('OrderCreatedConsumer', () => {
     await consumer.handleMessage(msg);
 
     expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+    expect(mockLockService.release).toHaveBeenCalled();
   });
 
-  it('deve rejeitar e enviar para DLQ com NACK quando o JSON for corrompido', async () => {
+  it('deve rejeitar e enviar para DLQ com NACK quando o JSON for corrompido sem adquirir lock', async () => {
     const msg = createMockMessage('invalid-json{');
 
     await consumer.handleMessage(msg);
 
     expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false);
     expect(mockChannel.ack).not.toHaveBeenCalled();
+    expect(mockLockService.acquire).not.toHaveBeenCalled();
   });
 
-  it('deve rejeitar e enviar para DLQ quando faltarem campos obrigatórios no contrato', async () => {
+  it('deve rejeitar e enviar para DLQ quando faltarem campos obrigatórios no contrato sem adquirir lock', async () => {
     const msg = createMockMessage({
       orderId: '',
       customerId: 'cust-1',
@@ -191,5 +238,6 @@ describe('OrderCreatedConsumer', () => {
 
     expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false);
     expect(mockChannel.ack).not.toHaveBeenCalled();
+    expect(mockLockService.acquire).not.toHaveBeenCalled();
   });
 });
