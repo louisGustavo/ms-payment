@@ -262,9 +262,9 @@ O arquivo `.env.example` traz os valores padrão sanitizados para execução loc
 
 ---
 
-### 6.1. Execução Completa via Docker Compose (Recomendado)
+### 6.1. Execução Completa via Docker Compose (Instância Única)
 
-Suba o cluster completo do `payment-ms` (Aplicação, PostgreSQL dedicado na porta `5433`, Redis na porta `6379` e Debezium Server):
+Suba o cluster do `ms-payment` (Aplicação, PostgreSQL dedicado na porta `5433`, Redis na porta `6379` e Debezium Server):
 
 ```bash
 docker compose up -d --build
@@ -280,7 +280,70 @@ docker compose up -d --build
 
 ---
 
-### 6.2. Execução Local sem Docker (Desenvolvimento)
+### 6.2. Execução em Múltiplas Instâncias e Teste de Concorrência (Escala Horizontal)
+
+O `ms-payment` suporta execução simultânea de múltiplas réplicas (*Competing Consumers Pattern* no RabbitMQ) com garantia de que pedidos simultâneos não provoquem cobranças duplicadas, graças ao Lock Distribuído no Redis (`SET NX PX` com script Lua de liberação segura) e identificação de instâncias nos logs (`[Instance: <id>]`).
+
+#### 1. Subir o ambiente escalado com 2 instâncias:
+```bash
+docker compose up -d --build --scale ms-payment=2
+```
+
+O Docker Compose criará dinamicamente duas réplicas nomeadas automaticamente (ex.: `payment-ms-ms-payment-1` e `payment-ms-ms-payment-2`), compartilhando o mesmo pool de banco, mesma fila RabbitMQ e mesma instância do Redis, sem conflito de portas no host.
+
+#### 2. Acompanhar os logs intercalados de ambas as réplicas:
+```bash
+docker compose logs -f ms-payment
+```
+Ao iniciar, cada réplica registrará seu identificador exclusivo:
+```text
+ms-payment-1 | [Instance: a1b2c3d4e5f6] RabbitMQ Consumer conectado e escutando eventos order.created.
+ms-payment-2 | [Instance: 7890abcdef12] RabbitMQ Consumer conectado e escutando eventos order.created.
+```
+
+#### 3. Simular o Teste de Concorrência (Race Condition):
+Para validar a exclusão mútua distribuída, envie duas mensagens simultâneas com o **mesmo `orderId`** na exchange `order.events` com routing key `order.created`.
+
+Você pode realizar o envio via **Painel Web do RabbitMQ** ([http://localhost:15672](http://localhost:15672) -> Exchanges -> `order.events` -> *Publish message*) ou via curl/bash:
+
+**Payload de Teste:**
+```json
+{
+  "orderId": "order-concurrency-test-001",
+  "customerId": "cust-concurrent-99",
+  "totalAmount": 250.00,
+  "paymentDetails": {
+    "method": "CREDIT_CARD",
+    "paymentMethodId": "tok_visa_valid_001",
+    "installments": 1
+  }
+}
+```
+
+#### 4. Evidência Observada nos Logs:
+Ao receberem mensagens concorrentes para o mesmo pedido, ambas as réplicas tentarão adquirir o lock do recurso `lock:payment:order:order-concurrency-test-001` no Redis. Apenas uma réplica vencerá a corrida, e a outra descartará o duplicado com `ACK` imediatamente:
+
+```text
+ms-payment-1 | [Instance: a1b2c3d4e5f6] Consumindo mensagem para orderId: order-concurrency-test-001
+ms-payment-1 | [Instance: a1b2c3d4e5f6] [LOCK ADQUIRIDO] Processando cobrança para orderId: order-concurrency-test-001...
+ms-payment-2 | [Instance: 7890abcdef12] Consumindo mensagem para orderId: order-concurrency-test-001
+ms-payment-2 | [Instance: 7890abcdef12] [LOCK RECUSADO] Concorrência detectada para orderId: order-concurrency-test-001. Ignorando mensagem duplicada.
+ms-payment-1 | [Instance: a1b2c3d4e5f6] Pagamento 'pay-77682d1c' concluído com status: SUCCEEDED para orderId: order-concurrency-test-001
+```
+
+**Garantias Verificadas:**
+- Apenas uma cobrança é enviada ao Gateway de Pagamento.
+- A mensagem duplicada é retirada da fila sem erros e sem sobrecarregar o sistema.
+- A idempotência transacional no PostgreSQL garante que a base permaneça perfeitamente consistente.
+
+> [!NOTE]
+> **Validação Estrita de Contrato e DLQ:**
+> O payload de `order.created` exige obrigatoriamente os campos `orderId`, `customerId` e `totalAmount` (número). Caso uma mensagem seja enviada com formato incompleto (ex.: sem `customerId`), o consumidor automaticamente a rejeitará com `nack(false, false)` e a direcionará para a DLQ `payment-service.order-created.dlq`, registrando o log:
+> `[Instance: <id>] Mensagem com contrato incompleto. Descartando para DLQ: { ... }`
+
+---
+
+### 6.3. Execução Local sem Docker (Desenvolvimento)
 
 Caso possua o PostgreSQL e o RabbitMQ rodando localmente:
 
@@ -301,7 +364,7 @@ Caso possua o PostgreSQL e o RabbitMQ rodando localmente:
 
 ---
 
-### 6.3. Execução dos Testes Automatizados
+### 6.4. Execução dos Testes Automatizados
 
 O repositório possui uma suíte estrita de testes unitários desenvolvida sob o padrão AAA (*Arrange, Act, Assert*) com cobertura superior a 95%:
 
@@ -318,7 +381,7 @@ npm run test:watch
 
 ---
 
-### 6.4. Boas Práticas de Versionamento & DevSecOps
+### 6.5. Boas Práticas de Versionamento & DevSecOps
 
 O repositório adota políticas rigorosas de segurança, higienização e rastreabilidade para o ciclo de desenvolvimento:
 - **Sanitização de Segredos:** Arquivos `.env` reais, dumps de banco, logs e certificados são permanentemente ignorados via `.gitignore`. Apenas o modelo documentado `.env.example` com valores locais padrão de desenvolvimento é versionado.
@@ -396,8 +459,10 @@ payment-ms/
 │   │           ├── payment.routes.ts
 │   │           └── health.routes.ts
 │   ├── infra/                         # ADAPTADORES SECUNDÁRIOS (Driven / Outbound)
-│   │   ├── config/                    # Variáveis de ambiente fortemente tipadas
-│   │   │   └── env.ts
+│   │   ├── config/                    # Variáveis de ambiente e identificação de réplicas
+│   │   │   ├── env.ts
+│   │   │   ├── instance.ts            # Identificador exclusivo da instância (INSTANCE_ID)
+│   │   │   └── instance.spec.ts
 │   │   ├── concurrency/               # Lock Distribuído e Controle de Concorrência
 │   │   │   ├── redis-distributed-lock.service.ts      # Engine atômica com ioredis e script Lua
 │   │   │   └── redis-distributed-lock.service.spec.ts # Testes unitários do lock

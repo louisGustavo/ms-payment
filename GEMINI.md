@@ -125,6 +125,16 @@ Para impedir que múltiplas instâncias consumindo o RabbitMQ processem o mesmo 
 - **Mitigação de Concorrência**: Se a tentativa de aquisição retornar `null`, a instância descarta a mensagem duplicada com `ack` e registra advertência em log, garantindo que apenas a instância detentora execute a cobrança.
 - **Liberação Garantida**: A invocação do caso de uso reside dentro de um bloco `try/finally`, liberando o lock imediatamente após o processamento.
 
+### 4.6. Escalabilidade Horizontal e Rastreamento de Instâncias (Competing Consumers)
+O microsserviço suporta execução simultânea em múltiplas réplicas (`docker compose --scale ms-payment=N`):
+- **Docker Compose Escalável**: O serviço `ms-payment` não possui `container_name` estático (permitindo que o Compose nomeie dinamicamente como `payment-ms-ms-payment-1`, `payment-ms-ms-payment-2`) e utiliza `expose: ["3001"]` em vez de bind estático de portas no host, evitando conflitos de alocação de portas.
+- **Identificador Exclusivo de Instância (`src/infra/config/instance.ts`)**: Cada processo obtém ou gera seu `INSTANCE_ID` (via `process.env['INSTANCE_ID']`, `os.hostname()` ou UUID curto). No Docker, `os.hostname()` reflete o container ID de 12 caracteres hex.
+- **Padronização de Logs Distribuídos**: Todos os eventos críticos do consumidor AMQP e ciclo de vida devem conter o identificador da réplica e as tags de controle de concorrência:
+  - Consumo: `[Instance: <id>] Consumindo mensagem para orderId: <orderId>`
+  - Lock bem-sucedido: `[Instance: <id>] [LOCK ADQUIRIDO] Processando cobrança para orderId: <orderId>...`
+  - Concorrência detectada: `[Instance: <id>] [LOCK RECUSADO] Concorrência detectada para orderId: <orderId>. Ignorando mensagem duplicada.`
+  - Erro de contrato/DLQ: `[Instance: <id>] Mensagem com contrato incompleto. Descartando para DLQ: ...`
+
 ---
 
 ## 5. Estrutura de Diretórios e Nomenclaturas
@@ -160,7 +170,7 @@ payment-ms/
     │   ├── http/               # Controladores HTTP Fastify e rotas
     │   └── messaging/          # Consumidores AMQP RabbitMQ (order-created.consumer.ts)
     └── infra/
-        ├── config/             # Configurações de ambiente tipadas (env.ts)
+        ├── config/             # Configurações tipadas (env.ts) e instância (instance.ts)
         ├── concurrency/        # Lock Distribuído com Redis (redis-distributed-lock.service.ts)
         ├── database/           # Pool PostgreSQL e migrations (schema.sql, repositórios)
         ├── messaging/          # Conexão RabbitMQ e topologias
@@ -189,9 +199,9 @@ Para evitar conflito com o `order-ms` no mesmo host de desenvolvimento:
 
 | Serviço | Porta Host | Porta Container | Observações |
 | :--- | :--- | :--- | :--- |
-| **payment-ms (HTTP)** | **`3001`** | `3001` | (`order-ms` utiliza a porta 3000) |
+| **ms-payment (HTTP)** | *(Rede Docker)* | `3001` | `expose: 3001` (sem bind estático no host para permitir escala `--scale ms-payment=N`) |
 | **PostgreSQL (payment_db)** | **`5433`** | `5432` | (`order-ms` utiliza a porta 5432) |
-| **Redis (Distributed Lock)**| **`6379`** | `6379` | Coordenação de concorrência (`payment-redis`) |
+| **Redis (Distributed Lock)**| **`6379`** | `6379` | Coordenação de concorrência (`ms-payment-redis` com volume persistente) |
 | **RabbitMQ AMQP** | `5672` | `5672` | Rede Docker `ecommerce-network` |
 | **RabbitMQ Management** | `15672` | `15672` | Painel Web: `http://localhost:15672` (guest/guest) |
 | **Debezium CDC Runner** | - | - | Container interno conectado à rede compartilhada |
@@ -199,7 +209,7 @@ Para evitar conflito com o `order-ms` no mesmo host de desenvolvimento:
 ### Exchanges & Filas no RabbitMQ
 - **Exchange Consumida**: `order.events` (Tipo: `topic`, Durable)
   - **Routing Key**: `order.created`
-  - **Fila Principal**: `payment-service.order-created`
+  - **Fila Principal**: `payment-service.order-created` (Consumida em *Competing Consumers Pattern* pelas réplicas)
   - **Fila DLQ**: `payment-service.order-created.dlq` (atrelada a `ecommerce.dlx`)
 - **Exchange Publicada (pelo Debezium)**: `payment.events` (Tipo: `topic`, Durable)
   - **Routing Keys**: `payment.succeeded`, `payment.failed`
@@ -231,14 +241,17 @@ npm run test:cov
 
 ### Comandos Docker Compose
 ```bash
-# Subir todo o ambiente de pagamentos (App + Postgres + Debezium)
+# Subir todo o ambiente de pagamentos em réplica única
 docker compose up -d
 
-# Recompilar a imagem do payment-ms e reiniciar
-docker compose up -d --build payment-ms
+# Subir com escalabilidade horizontal (2 ou mais réplicas simultâneas)
+docker compose up -d --build --scale ms-payment=2
 
-# Ver logs do serviço de pagamentos
-docker compose logs -f payment-ms
+# Recompilar a imagem do ms-payment e reiniciar
+docker compose up -d --build ms-payment
+
+# Acompanhar logs intercalados de todas as réplicas do ms-payment
+docker compose logs -f ms-payment
 
 # Ver logs do motor CDC Debezium
 docker compose logs -f payment-debezium
@@ -276,4 +289,8 @@ Ao editar, estender ou refatorar o código deste repositório, os agentes **DEVE
 8. **Lock Distribuído e Concorrência**:
    - Nunca importe a biblioteca do Redis (`ioredis`) dentro de `@domain/*` ou `@application/*`. Toda coordenação de concorrência deve passar pela abstração `DistributedLockService`.
    - Garanta que todo lock adquirido seja liberado com script Lua seguro dentro de um bloco `finally`.
+9. **Escalabilidade Horizontal e Nomenclatura Docker**:
+   - **NUNCA** adicione `container_name` estático no serviço `ms-payment` do `docker-compose.yml`, permitindo que o Compose nomeie réplicas dinamicamente ao escalar (`--scale ms-payment=N`).
+   - **NUNCA** defina bind estático de porta no host (`ports: ["3001:3001"]`) no serviço `ms-payment`; utilize `expose: ["3001"]` para prevenir conflito de portas entre réplicas.
+   - Preserve a identificação de instâncias em logs através de `[Instance: ${this.instanceId}]` e as tags `[LOCK ADQUIRIDO]` e `[LOCK RECUSADO]`.
 

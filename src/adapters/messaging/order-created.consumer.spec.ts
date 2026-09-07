@@ -107,12 +107,16 @@ describe('OrderCreatedConsumer', () => {
   });
 
   it('deve processar mensagem válida, adquirindo o lock e liberando no finally, e confirmando com ACK', async () => {
+    const consoleInfoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
     const msg = createMockMessage(validPayload);
 
     await consumer.handleMessage(msg);
 
     const expectedLockResource = `lock:payment:order:${validPayload.orderId}`;
     expect(mockLockService.acquire).toHaveBeenCalledWith(expectedLockResource, expect.any(Number));
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/\[Instance: .*\] \[LOCK ADQUIRIDO\] Processando cobrança para orderId:/)
+    );
     expect(mockUseCase.execute).toHaveBeenCalledWith({
       orderId: validPayload.orderId,
       customerId: validPayload.customerId,
@@ -127,6 +131,8 @@ describe('OrderCreatedConsumer', () => {
     expect(mockLockService.release).toHaveBeenCalledWith(expectedLockResource, 'mock-token-uuid-1234');
     expect(mockChannel.ack).toHaveBeenCalledWith(msg);
     expect(mockChannel.nack).not.toHaveBeenCalled();
+
+    consoleInfoSpy.mockRestore();
   });
 
   it('deve descartar com ACK e registrar aviso quando o lock distribuído NÃO for adquirido (concorrência detectada)', async () => {
@@ -139,7 +145,7 @@ describe('OrderCreatedConsumer', () => {
     const expectedLockResource = `lock:payment:order:${validPayload.orderId}`;
     expect(mockLockService.acquire).toHaveBeenCalledWith(expectedLockResource, expect.any(Number));
     expect(consoleWarnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Concorrência detectada: Lock 'lock:payment:order:")
+      expect.stringMatching(/\[Instance: .*\] \[LOCK RECUSADO\] Concorrência detectada para orderId:/)
     );
     expect(mockUseCase.execute).not.toHaveBeenCalled();
     expect(mockLockService.release).not.toHaveBeenCalled();
@@ -239,5 +245,29 @@ describe('OrderCreatedConsumer', () => {
     expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false);
     expect(mockChannel.ack).not.toHaveBeenCalled();
     expect(mockLockService.acquire).not.toHaveBeenCalled();
+  });
+
+  it('deve utilizar instanceId customizado passado no construtor e incluir nos logs', async () => {
+    const customInstanceId = 'inst-custom-999';
+    const customConsumer = new OrderCreatedConsumer(
+      mockChannel as unknown as Channel,
+      mockUseCase as unknown as ProcessPaymentUseCase,
+      mockLockService,
+      customInstanceId
+    );
+
+    const consoleInfoSpy = jest.spyOn(console, 'info').mockImplementation(() => {});
+    const msg = createMockMessage(validPayload);
+
+    await customConsumer.handleMessage(msg);
+
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      `[Instance: ${customInstanceId}] Consumindo mensagem para orderId: ${validPayload.orderId}`
+    );
+    expect(consoleInfoSpy).toHaveBeenCalledWith(
+      `[Instance: ${customInstanceId}] [LOCK ADQUIRIDO] Processando cobrança para orderId: ${validPayload.orderId}...`
+    );
+
+    consoleInfoSpy.mockRestore();
   });
 });

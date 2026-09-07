@@ -1,13 +1,12 @@
 services:
-  # Aplicação Principal: payment-ms
-  payment-ms:
+  # Aplicação Principal: ms-payment (Pronto para escala horizontal --scale ms-payment=N)
+  ms-payment:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ms-payment-app
     restart: unless-stopped
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     environment:
       - NODE_ENV=production
       - PORT=3001
@@ -48,6 +47,8 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
+    volumes:
+      - payment_redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -112,4 +113,5 @@ networks:
 
 volumes:
   payment_postgres_data:
+  payment_redis_data:
   payment_debezium_data:

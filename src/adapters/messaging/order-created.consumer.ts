@@ -2,6 +2,7 @@ import { Channel, ConsumeMessage } from 'amqplib';
 import { ProcessPaymentUseCase } from '@application/use-cases/process-payment.use-case';
 import { DistributedLockService } from '@application/ports/distributed-lock.service';
 import { env } from '@infra/config/env';
+import { INSTANCE_ID } from '@infra/config/instance';
 
 export interface OrderCreatedPayload {
   readonly eventName?: string;
@@ -27,11 +28,16 @@ export interface OrderCreatedPayload {
 }
 
 export class OrderCreatedConsumer {
+  private readonly instanceId: string;
+
   constructor(
     private readonly channel: Channel,
     private readonly processPaymentUseCase: ProcessPaymentUseCase,
-    private readonly distributedLockService: DistributedLockService
-  ) {}
+    private readonly distributedLockService: DistributedLockService,
+    instanceId?: string
+  ) {
+    this.instanceId = instanceId || INSTANCE_ID;
+  }
 
   public async setupTopology(): Promise<void> {
     const exchange = env.RABBITMQ_ORDER_EVENTS_EXCHANGE;
@@ -73,7 +79,7 @@ export class OrderCreatedConsumer {
     await this.setupTopology();
     const queue = env.RABBITMQ_PAYMENT_QUEUE;
 
-    console.info(`[OrderCreatedConsumer] Iniciando consumo da fila '${queue}'...`);
+    console.info(`[Instance: ${this.instanceId}] Iniciando consumo da fila '${queue}'...`);
 
     await this.channel.consume(queue, async (msg: ConsumeMessage | null) => {
       if (!msg) return;
@@ -81,7 +87,7 @@ export class OrderCreatedConsumer {
       try {
         await this.handleMessage(msg);
       } catch (err) {
-        console.error('[OrderCreatedConsumer] Erro fatal ao processar mensagem. Enviando para DLQ:', err);
+        console.error(`[Instance: ${this.instanceId}] Erro fatal ao processar mensagem. Enviando para DLQ:`, err);
         // Nack sem requeue direciona a mensagem para a DLQ
         this.channel.nack(msg, false, false);
       }
@@ -95,7 +101,7 @@ export class OrderCreatedConsumer {
     try {
       parsed = JSON.parse(rawContent);
     } catch {
-      console.error('[OrderCreatedConsumer] Payload inválido (não é JSON válido). Descartando para DLQ.');
+      console.error(`[Instance: ${this.instanceId}] Payload inválido (não é JSON válido). Descartando para DLQ.`);
       this.channel.nack(msg, false, false);
       return;
     }
@@ -115,10 +121,12 @@ export class OrderCreatedConsumer {
     }
 
     if (!payload.orderId || !payload.customerId || typeof payload.totalAmount !== 'number') {
-      console.error('[OrderCreatedConsumer] Mensagem com contrato incompleto. Descartando para DLQ:', payload);
+      console.error(`[Instance: ${this.instanceId}] Mensagem com contrato incompleto. Descartando para DLQ:`, payload);
       this.channel.nack(msg, false, false);
       return;
     }
+
+    console.info(`[Instance: ${this.instanceId}] Consumindo mensagem para orderId: ${payload.orderId}`);
 
     // Controle de Concorrência Distribuída (Lock por recurso de Pedido)
     const lockResource = `lock:payment:order:${payload.orderId}`;
@@ -127,14 +135,16 @@ export class OrderCreatedConsumer {
 
     if (!lockToken) {
       console.warn(
-        `[OrderCreatedConsumer] Concorrência detectada: Lock '${lockResource}' já retido por outra instância. Descartando mensagem concorrente com ACK para evitar cobrança duplicada.`
+        `[Instance: ${this.instanceId}] [LOCK RECUSADO] Concorrência detectada para orderId: ${payload.orderId}. Ignorando mensagem duplicada.`
       );
       this.channel.ack(msg);
       return;
     }
 
     try {
-      console.info(`[OrderCreatedConsumer] Processando cobrança do pedido '${payload.orderId}'...`);
+      console.info(
+        `[Instance: ${this.instanceId}] [LOCK ADQUIRIDO] Processando cobrança para orderId: ${payload.orderId}...`
+      );
 
       const result = await this.processPaymentUseCase.execute({
         orderId: payload.orderId,
@@ -149,10 +159,10 @@ export class OrderCreatedConsumer {
       });
 
       if (result.isDuplicate) {
-        console.info(`[OrderCreatedConsumer] Pedido '${payload.orderId}' já foi processado anteriormente (Idempotência).`);
+        console.info(`[Instance: ${this.instanceId}] Pedido '${payload.orderId}' já foi processado anteriormente (Idempotência).`);
       } else {
         console.info(
-          `[OrderCreatedConsumer] Pagamento '${result.paymentId}' concluído com status: ${result.status}`
+          `[Instance: ${this.instanceId}] Pagamento '${result.paymentId}' concluído com status: ${result.status} para orderId: ${payload.orderId}`
         );
       }
 

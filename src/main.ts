@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { env } from '@infra/config/env';
+import { INSTANCE_ID } from '@infra/config/instance';
 import { PostgresPool } from '@infra/database/postgres.pool';
 import { PostgresPaymentRepository } from '@infra/database/postgres-payment.repository';
 import { MockPaymentGateway } from '@infra/gateways/mock-payment.gateway';
@@ -16,8 +17,8 @@ import { buildApp } from '@infra/http/app';
 
 async function bootstrap() {
   console.info('====================================================');
-  console.info('Iniciando Payment Microservice (payment-ms)...');
-  console.info(`Ambiente: ${env.NODE_ENV}`);
+  console.info(`[Instance: ${INSTANCE_ID}] Iniciando Payment Microservice (payment-ms)...`);
+  console.info(`[Instance: ${INSTANCE_ID}] Ambiente: ${env.NODE_ENV} | Host: ${env.HOST}:${env.PORT}`);
   console.info('====================================================');
 
   // 1. Inicializa o Pool do PostgreSQL e executa migrações estruturais do schema
@@ -65,11 +66,11 @@ async function bootstrap() {
   const rmq = RabbitMQConnection.getInstance();
   try {
     const channel = await rmq.connect();
-    const consumer = new OrderCreatedConsumer(channel, processPaymentUseCase, redisLockService);
+    const consumer = new OrderCreatedConsumer(channel, processPaymentUseCase, redisLockService, INSTANCE_ID);
     await consumer.start();
-    console.info('[Bootstrap] RabbitMQ Consumer conectado e escutando eventos order.created.');
+    console.info(`[Instance: ${INSTANCE_ID}] RabbitMQ Consumer conectado e escutando eventos order.created.`);
   } catch (err) {
-    console.error('[Bootstrap] Falha ao conectar ao RabbitMQ. O serviço tentará reconectar:', err);
+    console.error(`[Instance: ${INSTANCE_ID}] Falha ao conectar ao RabbitMQ. O serviço tentará reconectar:`, err);
   }
 
   // 5. Inicialização da API HTTP Fastify
@@ -82,25 +83,25 @@ async function bootstrap() {
 
   try {
     await app.listen({ port: env.PORT, host: env.HOST });
-    console.info(`[Bootstrap] Servidor HTTP ativo em http://${env.HOST}:${env.PORT}`);
-    console.info(`[Bootstrap] Swagger UI disponível em http://${env.HOST}:${env.PORT}/docs`);
+    console.info(`[Instance: ${INSTANCE_ID}] Servidor HTTP ativo em http://${env.HOST}:${env.PORT}`);
+    console.info(`[Instance: ${INSTANCE_ID}] Swagger UI disponível em http://${env.HOST}:${env.PORT}/docs`);
   } catch (err) {
-    console.error('[Bootstrap] Erro ao iniciar servidor HTTP:', err);
+    console.error(`[Instance: ${INSTANCE_ID}] Erro ao iniciar servidor HTTP:`, err);
     process.exit(1);
   }
 
   // 6. Encerramento Gracioso (Graceful Shutdown)
   const shutdown = async (signal: string) => {
-    console.info(`\n[Bootstrap] Sinal ${signal} recebido. Encerrando recursos com segurança...`);
+    console.info(`\n[Instance: ${INSTANCE_ID}] Sinal ${signal} recebido. Encerrando recursos com segurança...`);
     try {
       await app.close();
       await rmq.close();
       await redisLockService.close();
       await postgresPool.close();
-      console.info('[Bootstrap] Recursos finalizados com sucesso. Encerrando processo.');
+      console.info(`[Instance: ${INSTANCE_ID}] Recursos finalizados com sucesso. Encerrando processo.`);
       process.exit(0);
     } catch (err) {
-      console.error('[Bootstrap] Erro durante encerramento gracioso:', err);
+      console.error(`[Instance: ${INSTANCE_ID}] Erro durante encerramento gracioso:`, err);
       process.exit(1);
     }
   };
